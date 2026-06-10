@@ -19,7 +19,7 @@
 #   REPO_DIR              repo checkout location           (default: /home/vpsroot/grokflow[-staging])
 #   COMPOSE_FILE          compose file                     (default: docker-compose.intranet.yml)
 #   COMPOSE_PROJECT_NAME  docker project name              (default: grokflow / grokflow-staging)
-#   ENV_FILE              env file passed to docker compose (default: .env.prod / .env.staging)
+#   ENV_FILE              env file passed to docker-compose (default: .env.prod / .env.staging)
 #   DEPLOY_WEBHOOK_URL    Discord-compatible webhook URL   (optional; silent if unset)
 #   HEALTH_TIMEOUT_SEC    seconds to wait for backend healthy after deploy (default: 90)
 #   ROLLBACK_ON_FAIL      "true" enables auto-rollback     (default: true)
@@ -132,7 +132,7 @@ if [[ "$PCT" -ge 90 ]]; then
     docker image prune -af 2>&1 | tail -3
 fi
 
-DC="docker compose -p $COMPOSE_PROJECT_NAME --env-file $ENV_FILE -f $COMPOSE_FILE"
+DC="docker-compose -p $COMPOSE_PROJECT_NAME --env-file $ENV_FILE -f $COMPOSE_FILE"
 
 deploy_failed=false
 failure_reason=""
