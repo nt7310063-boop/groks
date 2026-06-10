@@ -56,6 +56,7 @@ _STATSIG_LOCKS: dict[str, _asyncio_for_lock.Lock] = {}
 # call (none observed during cooldown) would also clear it implicitly
 # the next time the entry's timestamp is older than cooldown.
 _API_BLOCKED_UNTIL: dict[str, float] = {}
+_API_BLOCK_COUNT: dict[str, int] = {}  # consecutive block count per profile
 
 
 def _statsig_lock(cache_key: str) -> _asyncio_for_lock.Lock:
@@ -222,6 +223,21 @@ class GrokProvider(Provider):
             # certain to 403 again, and the ~15s round-trip to find out
             # is pure waste on the critical path. Browser fallback takes
             # over immediately.
+            # WARP readiness check — only if VNC is already running.
+            # Don't spawn here; the downstream paths handle spawning themselves.
+            _pid = self._profile_id_from_path(job.profile_path)
+            _vnc_info = vnc_manager.get_for_profile(_pid)
+            if _vnc_info and _vnc_info.get("running"):
+                _cdp_ep = _vnc_info.get("cdp_endpoint", "")
+                _warp_tag = f"warp:{_pid[:8]}"
+                _warp_ok = await self._wait_warp_ready(_cdp_ep, _warp_tag, timeout=30)
+                if not _warp_ok:
+                    return JobResult(
+                        success=False, error_code="network_error",
+                        error_message="VNC proxy (WARP) not ready after 30s — container may be starting up.",
+                        retryable=True,
+                    )
+
             if job.job_type == "image" and not self._api_path_blocked(job.profile_path):
                 api_result = await self._run_image_via_api(job)
                 if api_result is not None:
@@ -270,6 +286,75 @@ class GrokProvider(Provider):
                          error_message=f"Grok provider unsupported job_type: {job.job_type}")
 
     @staticmethod
+    async def _wait_warp_ready(cdp_endpoint: str, tag: str, timeout: int = 45) -> bool:
+        """Wait up to `timeout` seconds for WARP proxy to be ready in VNC container.
+
+        Two-phase check:
+          1. CDP must be responsive (Chromium is up).
+          2. SOCKS5 proxy at 127.0.0.1:40000 inside the container must be able
+             to reach the internet (WARP daemon is connected).
+
+        Phase 2 is tested by docker exec'ing a curl command inside the VNC
+        container. This catches the case where Chromium is alive but WARP
+        hasn't finished connecting yet (ERR_PROXY_CONNECTION_FAILED).
+        """
+        import asyncio
+        import httpx
+        import docker
+
+        # Phase 1: wait for CDP
+        cdp_ready = False
+        for attempt in range(min(timeout // 3, 5)):
+            try:
+                async with httpx.AsyncClient(timeout=3) as client:
+                    resp = await client.get(f"{cdp_endpoint}/json/version")
+                    if resp.status_code == 200 and resp.json().get("Browser"):
+                        cdp_ready = True
+                        break
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+            if attempt == 0:
+                print(f"[{tag}] waiting for CDP...", flush=True)
+
+        if not cdp_ready:
+            print(f"[{tag}] CDP not ready after check — skipping WARP test", flush=True)
+            return False
+
+        # Phase 2: test actual WARP proxy inside the container.
+        # Extract container name from cdp_endpoint: http://grokflow-vnc-XXXXX:9222
+        try:
+            host_part = cdp_endpoint.split("//")[1].split(":")[0]
+        except (IndexError, AttributeError):
+            # Can't parse — assume ready (fallback to old behavior)
+            return True
+
+        cli = docker.from_env()
+        remaining = timeout - 15  # already spent ~15s on CDP checks
+        for attempt in range(max(remaining // 5, 1)):
+            try:
+                container = cli.containers.get(host_part)
+                exit_code, output = container.exec_run(
+                    ["curl", "-sS", "-m", "5", "-x", "socks5h://127.0.0.1:40000",
+                     "-o", "/dev/null", "-w", "%{http_code}", "https://grok.com/"],
+                    demux=False,
+                )
+                # Any HTTP response (even 403) means proxy is working.
+                # Only connection failures (exit_code != 0, no http_code) mean WARP is down.
+                http_code = output.decode().strip() if output else ""
+                if exit_code == 0 and http_code.isdigit() and int(http_code) > 0:
+                    return True
+            except Exception as exc:
+                if attempt == 0:
+                    print(f"[{tag}] WARP proxy test error: {exc}", flush=True)
+            await asyncio.sleep(5)
+            if attempt == 0:
+                print(f"[{tag}] waiting for WARP proxy...", flush=True)
+
+        print(f"[{tag}] WARP proxy not ready after {timeout}s", flush=True)
+        return False
+
+    @staticmethod
     def _profile_id_from_path(profile_path: str) -> str:
         return profile_path.rstrip("/").split("/")[-1]
 
@@ -288,6 +373,7 @@ class GrokProvider(Provider):
             return False
         if time.monotonic() >= deadline:
             _API_BLOCKED_UNTIL.pop(profile_id, None)
+            _API_BLOCK_COUNT.pop(profile_id, None)  # reset consecutive counter
             return False
         return True
 
@@ -295,12 +381,21 @@ class GrokProvider(Provider):
     def _mark_api_blocked(profile_path: str) -> None:
         """Record that this profile just got a 403 / provider_blocked on
         the API path. Subsequent jobs within the cooldown window skip
-        the API attempt and go straight to the Playwright fallback."""
+        the API attempt and go straight to the Playwright fallback.
+
+        Uses exponential backoff: each consecutive block doubles the
+        cooldown (300 -> 600 -> 1200 -> max 3600s). Counter resets
+        when _api_path_blocked returns False (cooldown expired without
+        another block)."""
         profile_id = profile_path.rstrip("/").split("/")[-1]
-        cooldown = float(os.environ.get("GROK_API_BLOCK_COOLDOWN_SEC", "300"))
+        base_cooldown = float(os.environ.get("GROK_API_BLOCK_COOLDOWN_SEC", "300"))
+        max_cooldown = float(os.environ.get("GROK_API_BLOCK_MAX_COOLDOWN_SEC", "3600"))
+        count = _API_BLOCK_COUNT.get(profile_id, 0) + 1
+        _API_BLOCK_COUNT[profile_id] = count
+        cooldown = min(base_cooldown * (2 ** (count - 1)), max_cooldown)
         _API_BLOCKED_UNTIL[profile_id] = time.monotonic() + cooldown
         print(
-            f"[grok][api:{profile_id[:8]}] marked api-blocked for {int(cooldown)}s",
+            f"[grok][api:{profile_id[:8]}] marked api-blocked for {int(cooldown)}s (consecutive={count})",
             flush=True,
         )
 
@@ -448,6 +543,14 @@ class GrokProvider(Provider):
         if not info:
             return None
         cdp_endpoint = info["cdp_endpoint"]
+
+        # WARP readiness check: wait for proxy to be functional
+        # before attempting any CDP/API calls. Avoids ERR_PROXY_CONNECTION_FAILED
+        # on freshly spawned VNC containers.
+        tag_warp = f"warp:{self._profile_id_from_path(job.profile_path)[:8]}"
+        if not await self._wait_warp_ready(cdp_endpoint, tag_warp, timeout=30):
+            self._log(tag_warp, "VNC proxy not ready — skipping API path")
+            return None
 
         # Retry-with-backoff helper handles the transient empty-body case
         # we used to fail on. See `_cdp_discover` docstring.
@@ -1059,6 +1162,20 @@ class GrokProvider(Provider):
                         else:
                             self._log(tag, f"polling chat… {elapsed}s — 0 grok assets yet")
                         last_log = elapsed
+                    # Fast-fail: if 60s passed with zero generated assets,
+                    # Grok is likely ignoring this submit (rate-limited or
+                    # quota exhausted). Bail early instead of waiting the
+                    # full timeout — saves ~30s per doomed attempt.
+                    if elapsed >= 60 and first_match_at is None:
+                        self._log(tag, f"fast-fail: {elapsed}s in project chat, 0 generated assets — Grok ignoring submit")
+                        return JobResult(
+                            success=False, error_code="rate_limited",
+                            error_message=(
+                                f"Project chat: no generated image after {elapsed}s. "
+                                "Grok đang throttle hoặc hết quota."
+                            ),
+                            retryable=True,
+                        )
                     await asyncio.sleep(3)
 
                 if not found_url:
@@ -1133,7 +1250,7 @@ class GrokProvider(Provider):
                             u = (p.url or "")
                             if "/imagine/post/" in u:
                                 try:
-                                    await asyncio.wait_for(p.close(), timeout=2)
+                                    await asyncio.wait_for(p.close(), timeout=3)
                                     self._log(tag, f"GC closed result tab: …{u[-40:]}")
                                 except Exception:  # noqa: BLE001
                                     pass
@@ -1142,7 +1259,7 @@ class GrokProvider(Provider):
                 except Exception:  # noqa: BLE001
                     pass
                 try:
-                    await browser.close()
+                    await browser.disconnect()
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -1215,7 +1332,7 @@ class GrokProvider(Provider):
                     )
                 context = browser.contexts[0] if browser.contexts else None
                 if not context:
-                    await browser.close()
+                    await browser.disconnect()
                     return JobResult(success=False, error_code="browser_crashed",
                                      error_message="No browser context found",
                                      retryable=True)
@@ -1254,8 +1371,12 @@ class GrokProvider(Provider):
                                 continue  # may belong to a sibling worker
                             if "grok.com" not in u and "x.ai" not in u:
                                 continue  # not ours
-                            await asyncio.wait_for(old.close(), timeout=2)
-                            gc_count += 1
+                            # Only close STALE tabs — never close active job tabs
+                            # Active: /imagine (prompt page), /imagine/post/ (polling result)
+                            # Stale: homepage (/), /chat/, /share/, old /project/ tabs
+                            if u.rstrip('/').endswith('grok.com') or '/chat/' in u or '/share/' in u:
+                                await asyncio.wait_for(old.close(), timeout=3)
+                                gc_count += 1
                         except Exception:  # noqa: BLE001
                             pass
                     if gc_count:
@@ -1836,8 +1957,8 @@ class GrokProvider(Provider):
                         page.remove_listener("request", _on_request)
                         return JobResult(
                             success=False, error_code="rate_limited",
-                            error_message=f"Grok rejected submit — '{found}'.",
-                            retryable=True,
+                            error_message=f"Grok rejected submit — '{found}'. Quota hết, không retry.",
+                            retryable=False,
                         )
                 # Keep the request listener attached during polling so the
                 # watchdog can distinguish "Grok ignored the submit" (no
@@ -2110,7 +2231,7 @@ class GrokProvider(Provider):
                         u = (p.url or "")
                         if any(s in u for s in _STALE):
                             try:
-                                await asyncio.wait_for(p.close(), timeout=2)
+                                await asyncio.wait_for(p.close(), timeout=3)
                                 self._log(tag, f"GC closed result tab: …{u[-40:]}")
                             except Exception:  # noqa: BLE001
                                 pass

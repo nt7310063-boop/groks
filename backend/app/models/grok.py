@@ -194,7 +194,7 @@ class Job(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="pending", index=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
-    max_retry: Mapped[int] = mapped_column(Integer, default=3)
+    max_retry: Mapped[int] = mapped_column(Integer, default=2)
     result_file_id: Mapped[uuid.UUID | None] = mapped_column(UUIDType)
     result_url: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)

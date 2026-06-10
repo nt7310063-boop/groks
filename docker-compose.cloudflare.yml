@@ -57,7 +57,13 @@ services:
         condition: service_healthy
     volumes:
       - storage_data:/app/storage
-      - profile_data:/app/browser_profiles
+      - ./browser_profiles:/app/browser_profiles
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/nginx/grokflow-vhosts:/host_nginx_vhosts
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
 
   worker:
     build:
@@ -78,8 +84,18 @@ services:
         condition: service_healthy
     volumes:
       - storage_data:/app/storage
-      - profile_data:/app/browser_profiles
+      - ./browser_profiles:/app/browser_profiles
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/nginx/grokflow-vhosts:/host_nginx_vhosts
     command: ["python", "-m", "app.workers.run"]
+    healthcheck:
+      test: ["NONE"]
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    healthcheck:
+      test: ["NONE"]
 
   frontend:
     build:
@@ -92,13 +108,39 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["NONE"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["NONE"]
 
   cloudflared:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
+    network_mode: "service:frontend"
     command: ["tunnel", "--no-autoupdate", "run", "--token", "${CLOUDFLARE_TUNNEL_TOKEN:?set in .env.prod}"]
+
+  idle-cleanup:
+    image: grokflow/backend:${TAG:-latest}
+    restart: unless-stopped
+    env_file: ./.env.prod
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-grokflow}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-grokflow}
+      LOCAL_STORAGE_PATH: /app/storage
+      PROFILE_BASE_PATH: /app/browser_profiles
+      PROFILE_BASE_PATH_HOST: ${PWD}/browser_profiles
     depends_on:
-      - frontend
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./browser_profiles:/app/browser_profiles
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["python", "-m", "app.workers.idle_cleanup"]
+    healthcheck:
+      test: ["NONE"]
 
 volumes:
   postgres_data:

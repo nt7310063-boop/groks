@@ -36,8 +36,8 @@ class Settings(BaseSettings):
     #   JOB_BACKOFF_SECONDS         — generic transient failures
     #   JOB_RATE_LIMIT_BACKOFF      — when the vendor returns 429
     # Defaults match the historical hard-coded tables in workers/run.py.
-    JOB_BACKOFF_SECONDS: str = "15,60,180"
-    JOB_RATE_LIMIT_BACKOFF: str = "60,300,900"
+    JOB_BACKOFF_SECONDS: str = "10,30,60"
+    JOB_RATE_LIMIT_BACKOFF: str = "30,60,120"
     # Error codes the worker should NEVER retry (terminal — fail fast).
     JOB_TERMINAL_ERROR_CODES: str = (
         "cookie_expired,captcha_required,provider_blocked,"

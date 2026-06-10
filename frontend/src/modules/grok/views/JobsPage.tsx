@@ -139,13 +139,21 @@ export function JobsPage() {
     },
   });
   const cancelAll = useMutation({
-    mutationFn: async () => {
-      const cancellable = (data?.items ?? []).filter((j) =>
-        ["pending", "queued", "running", "processing_provider"].includes(j.status),
-      );
-      await Promise.allSettled(cancellable.map((j) => jobsService.cancel(j.id)));
+    mutationFn: () => jobsService.cancelAll(),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["jobs"] }),
+      toast(`Đã hủy ${res.cancelled} jobs`, "success");
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["jobs"] }),
+    onError: (e: any) => toast(e?.response?.data?.detail?.message ?? "Cancel all lỗi", "error"),
+  });
+  const bulkCancel = useMutation({
+    mutationFn: (ids: string[]) => jobsService.bulkCancel(ids),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      setSelectedIds(new Set());
+      toast(`Đã hủy ${res.cancelled} jobs`, "success");
+    },
+    onError: (e: any) => toast(e?.response?.data?.detail?.message ?? "Bulk cancel lỗi", "error"),
   });
   const bulkDelete = useMutation({
     mutationFn: (ids: string[]) => jobsService.bulkDelete(ids),
@@ -172,19 +180,23 @@ export function JobsPage() {
   // user can't accidentally apply page-1 selections to page-2 rows.
   useEffect(() => { setSelectedIds(new Set()); }, [statusFilter, providerFilter, typeFilter, search, page, pageSize]);
 
-  // Items selectable for bulk delete = visible page only, not in-flight.
-  const deletableOnPage = (data?.items ?? []).filter(
-    (j) => !["running", "processing_provider", "uploading_result"].includes(j.status),
-  );
-  const allDeletableSelected =
-    deletableOnPage.length > 0 && deletableOnPage.every((j) => selectedIds.has(j.id));
+  // All visible page items are selectable
+  const selectableOnPage = data?.items ?? [];
+  const allSelected =
+    selectableOnPage.length > 0 && selectableOnPage.every((j) => selectedIds.has(j.id));
   const toggleSelectAll = () => {
-    if (allDeletableSelected) {
+    if (allSelected) {
       setSelectedIds(new Set());
     } else {
-      setSelectedIds(new Set(deletableOnPage.map((j) => j.id)));
+      setSelectedIds(new Set(selectableOnPage.map((j) => j.id)));
     }
   };
+  const selectedInFlight = items.filter((j) =>
+    selectedIds.has(j.id) && ["pending", "queued", "running", "processing_provider"].includes(j.status)
+  );
+  const selectedDeletable = items.filter((j) =>
+    selectedIds.has(j.id) && !["running", "processing_provider", "uploading_result"].includes(j.status)
+  );
   const toggleRow = (id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
@@ -299,21 +311,40 @@ export function JobsPage() {
                 So sánh {selectedIds.size}
               </button>
             )}
-          <button
-            className="btn-primary bg-rose-600 hover:bg-rose-700 inline-flex items-center gap-1.5"
-            disabled={bulkDelete.isPending}
-            onClick={async () => {
-              if (await confirm({
-                title: `Xoá ${selectedIds.size} job?`,
-                message: "Job đang chạy sẽ bị bỏ qua. Job đã xoá không khôi phục được.",
-                variant: "danger",
-                confirmLabel: `Xoá ${selectedIds.size}`,
-              })) bulkDelete.mutate(Array.from(selectedIds));
-            }}
-          >
-            <Trash2 size={14} />
-            {bulkDelete.isPending ? "Đang xoá…" : `Xoá ${selectedIds.size} job`}
-          </button>
+            {selectedInFlight.length > 0 && (
+              <button
+                className="btn-secondary text-amber-700 border-amber-200 hover:border-amber-300 inline-flex items-center gap-1.5"
+                disabled={bulkCancel.isPending}
+                onClick={async () => {
+                  if (await confirm({
+                    title: `Cancel ${selectedInFlight.length} job?`,
+                    message: "Các job được chọn đang chạy hoặc đang chờ sẽ bị hủy.",
+                    variant: "warning",
+                    confirmLabel: `Cancel ${selectedInFlight.length}`,
+                  })) bulkCancel.mutate(selectedInFlight.map(j => j.id));
+                }}
+              >
+                <Ban size={14} />
+                {bulkCancel.isPending ? "Đang hủy…" : `Cancel ${selectedInFlight.length} job`}
+              </button>
+            )}
+            {selectedDeletable.length > 0 && (
+              <button
+                className="btn-primary bg-rose-600 hover:bg-rose-700 inline-flex items-center gap-1.5"
+                disabled={bulkDelete.isPending}
+                onClick={async () => {
+                  if (await confirm({
+                    title: `Xoá ${selectedDeletable.length} job?`,
+                    message: "Các job được chọn sẽ bị xoá vĩnh viễn khỏi hệ thống.",
+                    variant: "danger",
+                    confirmLabel: `Xoá ${selectedDeletable.length}`,
+                  })) bulkDelete.mutate(selectedDeletable.map(j => j.id));
+                }}
+              >
+                <Trash2 size={14} />
+                {bulkDelete.isPending ? "Đang xoá…" : `Xoá ${selectedDeletable.length} job`}
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -340,10 +371,10 @@ export function JobsPage() {
                 <th className="px-3 py-2 w-8">
                   <input
                     type="checkbox"
-                    checked={allDeletableSelected}
+                    checked={allSelected}
                     onChange={toggleSelectAll}
-                    disabled={deletableOnPage.length === 0}
-                    title={allDeletableSelected ? "Bỏ chọn tất cả" : "Chọn tất cả (xoá được)"}
+                    disabled={selectableOnPage.length === 0}
+                    title={allSelected ? "Bỏ chọn tất cả" : "Chọn tất cả"}
                     className="cursor-pointer"
                   />
                 </th>
@@ -370,8 +401,7 @@ export function JobsPage() {
                         type="checkbox"
                         checked={selectedIds.has(j.id)}
                         onChange={() => toggleRow(j.id)}
-                        disabled={!deletable}
-                        title={deletable ? "Chọn để xoá hàng loạt" : "Job đang chạy không xoá được"}
+                        title="Chọn để thao tác hàng loạt"
                         className="cursor-pointer"
                       />
                     </td>

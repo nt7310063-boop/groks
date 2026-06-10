@@ -296,9 +296,16 @@ def refresh_vnc_map() -> bool:
         # 10001:10001 — subsequent writes go direct-path. Without this fix
         # we silently EACCES'd for hours on new VNC profiles.
         import os
-        tmp_path = VNC_MAP_PATH.with_suffix(VNC_MAP_PATH.suffix + ".tmp")
+        tmp_path = VNC_MAP_PATH.with_suffix(f"{VNC_MAP_PATH.suffix}.tmp.{os.getpid()}")
         tmp_path.write_text(text, encoding="utf-8")
-        os.replace(tmp_path, VNC_MAP_PATH)
+        try:
+            os.replace(tmp_path, VNC_MAP_PATH)
+        except OSError as e:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise e
         short_ids = [s for s, _ in entries]
         print(
             f"[vnc-map] wrote {len(entries)} entr"

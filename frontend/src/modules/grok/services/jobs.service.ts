@@ -43,6 +43,12 @@ export const jobsService = {
   setTags: (id: string, tags: string[]) =>
     api.put<Job>(`/api/jobs/${id}/tags`, { tags }).then((r) => r.data),
   cancel: (id: string) => api.post(`/api/jobs/${id}/cancel`),
+  cancelAll: () =>
+    api.post<{ cancelled: number }>("/api/jobs/cancel-all").then((r) => r.data),
+  bulkCancel: (ids: string[]) =>
+    api
+      .post<{ cancelled: number }>("/api/jobs/bulk-cancel", { ids })
+      .then((r) => r.data),
   remove: (id: string) => api.delete(`/api/jobs/${id}`),
 
   /** Delete many jobs in one request. Backend skips in-flight rows and

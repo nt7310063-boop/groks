@@ -188,8 +188,8 @@ def _start_locked(profile_id: str, profile_path: str, provider_url: str) -> dict
     # heavy React app + media decoders are loaded. With 4 concurrent slots
     # we need ~2.4GB for tabs + ~800MB for the rest of Chromium → 4GB cap.
     # Override via env if you scale slots beyond 4 or up to multiple profiles.
-    mem_limit = os.environ.get("VNC_MEM_LIMIT", "4g")
-    cpu_quota = int(os.environ.get("VNC_CPU_QUOTA", "200000"))  # 2.0 CPU
+    mem_limit = os.environ.get("VNC_MEM_LIMIT", "10g")
+    cpu_quota = int(os.environ.get("VNC_CPU_QUOTA", "500000"))  # 2.0 CPU
     run_kwargs = dict(
         image=VNC_IMAGE,
         name=name,
@@ -241,7 +241,7 @@ def _start_locked(profile_id: str, profile_path: str, provider_url: str) -> dict
             # right after setInputFiles). Override via
             # GROK_VNC_CHROMIUM_HEAP_MB on the backend for larger inputs
             # or memory-constrained hosts.
-            "CHROMIUM_HEAP_MB": os.environ.get("GROK_VNC_CHROMIUM_HEAP_MB", "2048"),
+            "CHROMIUM_HEAP_MB": os.environ.get("GROK_VNC_CHROMIUM_HEAP_MB", "6144"),
         },
         volumes={
             host_profile_path: {"bind": "/config", "mode": "rw"},

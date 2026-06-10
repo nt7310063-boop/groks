@@ -141,6 +141,12 @@ async def _resolve_profile_for_job(
     # still see them (that's their whole purpose).
     if job_type == "video":
         where_clauses.append(Profile.allows_video.is_(True))
+    # Heavy-tier profiles are RESERVED for video, but only as a SOFT
+    # preference (see the ORDER BY below), not a hard filter. Image jobs
+    # de-prioritize heavy profiles so they stay free for the video queue,
+    # yet a heavy profile is still usable as a FALLBACK when it is the only
+    # logged-in profile left. Hard-excluding here used to make image
+    # auto-pick fail with 422 whenever the pool was down to heavy-only.
     if assigned_to_install is not None:
         # Strictest scope: install. No owner fallback — admin must
         # explicitly assign a project to this install for it to show up.
@@ -168,11 +174,22 @@ async def _resolve_profile_for_job(
     load_column = (
         Profile.active_video_jobs if job_type == "video" else Profile.active_jobs
     )
+    # Tier ordering (soft preference, applied to BOTH job types):
+    #   - video jobs PREFER heavy (higher quota, more reliable) -> heavy first
+    #   - image jobs AVOID heavy (keep it free for the video queue) -> heavy
+    #     last, but still selected as a fallback when nothing else is up.
+    from sqlalchemy import case as sa_case
+    if job_type == "video":
+        tier_priority = sa_case((Profile.tier == "heavy", 0), else_=1)
+    else:
+        tier_priority = sa_case((Profile.tier == "heavy", 1), else_=0)
+
     stmt = (
         select(Profile)
         .join(User, User.id == Profile.user_id)
         .where(*where_clauses)
         .order_by(
+            tier_priority.asc(),
             load_column.asc(),
             func.coalesce(Profile.last_used_at, Profile.created_at).asc(),
         )

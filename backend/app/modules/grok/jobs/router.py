@@ -117,6 +117,23 @@ async def create_job(
     # WHAT the user can do; this gate caps THROUGHPUT (e.g. reseller bought
     # 500/day, sub-resold 100/day to kiosk Khách 1). No-op for super_admin
     # (domain_id+tool_install_id both NULL) or when no scope has a cap.
+    # Check Duplicate Request (5s Debounce - Option A: return existing job)
+    from datetime import datetime, timedelta
+    recent_duplicate = (await db.execute(
+        select(Job)
+        .where(
+            Job.user_id == user.id,
+            Job.prompt == payload.prompt,
+            Job.created_at >= datetime.utcnow() - timedelta(seconds=5)
+        )
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if recent_duplicate is not None:
+        print(f"[duplicate-gate] duplicate job detected, returning existing: {recent_duplicate.id}", flush=True)
+        return recent_duplicate
+
     await reserve_domain_quota(db, user.domain_id, user.tool_install_id)
 
     return await service.create_job(
@@ -267,6 +284,85 @@ async def retry_job(job_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Job:
     await db.commit()
     await db.refresh(job)
     return job
+
+
+class BulkCancelPayload(BaseModel):
+    ids: list[uuid.UUID]
+
+
+@router.post("/cancel-all")
+async def cancel_all_jobs(user: CurrentUser, db: DbSession):
+    from sqlalchemy import update
+    from app.models import Profile
+    
+    query = select(Job).where(
+        Job.status.in_(["pending", "queued", "running", "processing_provider", "uploading_result"])
+    )
+    if user.role != "admin":
+        query = query.where(Job.user_id == user.id)
+        
+    jobs = (await db.execute(query)).scalars().all()
+    
+    cancelled_count = 0
+    for job in jobs:
+        job.status = "cancelled"
+        db.add(JobLog(job_id=job.id, level="info", message="Job cancelled via Cancel All"))
+        cancelled_count += 1
+        
+    if cancelled_count > 0:
+        await db.commit()
+        # Recalculate profile active jobs
+        await db.execute(
+            update(Profile).values(
+                active_jobs=select(func.count(Job.id)).where(Job.profile_id == Profile.id, Job.status.in_(["running", "processing_provider", "uploading_result"])).scalar_subquery(),
+                active_video_jobs=select(func.count(Job.id)).where(Job.profile_id == Profile.id, Job.status.in_(["running", "processing_provider", "uploading_result"]), Job.job_type == "video").scalar_subquery()
+            )
+        )
+        await db.execute(
+            update(Profile).values(status="logged_in").where(Profile.status == "running_job", Profile.active_jobs == 0)
+        )
+        await db.commit()
+        
+    return {"cancelled": cancelled_count}
+
+
+@router.post("/bulk-cancel")
+async def bulk_cancel_jobs(
+    payload: BulkCancelPayload, user: CurrentUser, db: DbSession
+):
+    from sqlalchemy import update
+    from app.models import Profile
+    
+    query = select(Job).where(
+        Job.id.in_(payload.ids),
+        Job.status.in_(["pending", "queued", "running", "processing_provider", "uploading_result"])
+    )
+    if user.role != "admin":
+        query = query.where(Job.user_id == user.id)
+        
+    jobs = (await db.execute(query)).scalars().all()
+    
+    cancelled_count = 0
+    for job in jobs:
+        job.status = "cancelled"
+        db.add(JobLog(job_id=job.id, level="info", message="Job cancelled via Bulk Cancel"))
+        cancelled_count += 1
+        
+    if cancelled_count > 0:
+        await db.commit()
+        # Recalculate profile active jobs
+        await db.execute(
+            update(Profile).values(
+                active_jobs=select(func.count(Job.id)).where(Job.profile_id == Profile.id, Job.status.in_(["running", "processing_provider", "uploading_result"])).scalar_subquery(),
+                active_video_jobs=select(func.count(Job.id)).where(Job.profile_id == Profile.id, Job.status.in_(["running", "processing_provider", "uploading_result"]), Job.job_type == "video").scalar_subquery()
+            )
+        )
+        await db.execute(
+            update(Profile).values(status="logged_in").where(Profile.status == "running_job", Profile.active_jobs == 0)
+        )
+        await db.commit()
+        
+    return {"cancelled": cancelled_count}
 
 
 @router.post("/{job_id}/cancel", response_model=JobOut)

@@ -28,6 +28,28 @@ from app.models import File as FileModel, Job, JobLog, Profile
 _RUNNING_JOB_STATES = ("running", "processing_provider", "uploading_result")
 
 
+async def heal_stuck_jobs() -> int:
+    """Find jobs stuck in in-flight states for too long and mark them as failed.
+    This releases stuck slots and lets heal_stuck_profiles clean up the profile counters."""
+    fixed = 0
+    async with SessionLocal() as db:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        stuck_jobs = (await db.execute(
+            select(Job).where(
+                Job.status.in_(["running", "processing_provider", "uploading_result"]),
+                Job.updated_at < cutoff
+            )
+        )).scalars().all()
+        for job in stuck_jobs:
+            job.status = "failed"
+            job.error_message = "[timeout] Stuck in in-flight state (recovered by cleanup)"
+            fixed += 1
+            print(f"[idle-cleanup] marked stuck job {job.id} as failed (created_at={job.created_at})", flush=True)
+        if fixed:
+            await db.commit()
+    return fixed
+
+
 async def heal_stuck_profiles() -> int:
     """Find profiles stuck in `running_job` with no real running jobs and
     repair them in-place (no worker restart needed).
@@ -81,6 +103,13 @@ async def heal_stuck_profiles() -> int:
 async def cleanup(idle_hours: float) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=idle_hours)
     stopped = 0
+    # Heal stuck jobs first, so that heal_stuck_profiles will find live = 0 and release the profile
+    try:
+        healed_jobs = await heal_stuck_jobs()
+        if healed_jobs:
+            print(f"[idle-cleanup] healed {healed_jobs} stuck job(s)", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[idle-cleanup] heal_stuck_jobs failed: {exc}", flush=True)
     # Heal stuck profiles first so the rest of cleanup sees accurate state.
     try:
         healed = await heal_stuck_profiles()

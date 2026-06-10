@@ -159,6 +159,11 @@ export function CreateJobModal({
     });
     if (pool.length === 0) return null;
     const sorted = [...pool].sort((a, b) => {
+      // Mirror backend tier ordering: video prefers heavy (first), image
+      // avoids heavy (last) but still allows it as a fallback.
+      const tierRank = (p: Profile) =>
+        jobType === "video" ? (p.tier === "heavy" ? 0 : 1) : (p.tier === "heavy" ? 1 : 0);
+      if (tierRank(a) !== tierRank(b)) return tierRank(a) - tierRank(b);
       const aLoad = jobType === "video" ? (a.active_video_jobs ?? 0) : a.active_jobs;
       const bLoad = jobType === "video" ? (b.active_video_jobs ?? 0) : b.active_jobs;
       if (aLoad !== bLoad) return aLoad - bLoad;
