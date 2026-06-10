@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb x11vnc \
     novnc websockify \
     supervisor nginx-light \
-    fonts-liberation fonts-noto-color-emoji fonts-noto-cjk \
+    fonts-liberation fonts-noto-color-emoji fonts-noto-core fonts-noto-cjk fonts-noto-cjk \
     ca-certificates curl wget procps gnupg lsb-release \
     xdotool \
     python3 python3-websocket \

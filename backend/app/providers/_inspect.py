@@ -38,7 +38,7 @@ async def main(container: str):
         )
         print("'Sign in' visible:", signin_visible)
 
-        await browser.close()
+        await browser.disconnect()
 
 
 if __name__ == "__main__":

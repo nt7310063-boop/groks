@@ -1,29 +1,26 @@
 services:
   frontend:
     environment:
-      # Vite runs inside the frontend container; "localhost" here = the
-      # frontend container itself. Point /api proxy at the backend service
-      # name on the docker bridge so requests reach the backend container.
       VITE_DEV_API_TARGET: http://backend:8000
 
   backend:
-    ports: !override
-      - "8001:8000"
+    ports:
+      - 8001:8000
     environment:
       PROFILE_BASE_PATH: /app/browser_profiles
-      PROFILE_BASE_PATH_HOST: E:/DinhVanVu/GrokFlow/browser_profiles
+      PROFILE_BASE_PATH_HOST: /home/vpsroot/grokflow/browser_profiles
       VNC_NETWORK: grokflow_default
       VNC_IMAGE: grokflow/chrome-vnc:latest
     volumes:
       - ./browser_profiles:/app/browser_profiles
-      - //var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock
 
   worker:
     environment:
       PROFILE_BASE_PATH: /app/browser_profiles
-      PROFILE_BASE_PATH_HOST: E:/DinhVanVu/GrokFlow/browser_profiles
+      PROFILE_BASE_PATH_HOST: /home/vpsroot/grokflow/browser_profiles
       VNC_NETWORK: grokflow_default
       VNC_IMAGE: grokflow/chrome-vnc:latest
     volumes:
       - ./browser_profiles:/app/browser_profiles
-      - //var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -11,6 +11,7 @@ State machine per job:
 
 import asyncio
 import os
+import time
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -572,10 +573,20 @@ async def process_one(db: AsyncSession, job: Job) -> None:
                             message=f"Rotating away from profile {pid_str[:8]} (reason={reason}), banned={len(banned)}",
                         ))
                         job.profile_id = None
-                        job.next_attempt_at = None  # immediate retry on sibling
-                        job.status = "queued"
-                        db.add(JobLog(job_id=job.id, level="info",
-                                      message=f"Retry immediately on sibling profile ({job.retry_count}/{job.max_retry}, code={error_code})"))
+                        # Add minimum backoff when rotating for timeout/rate_limited
+                        # to avoid burning all retries in seconds when Grok is
+                        # rate-limiting at application level (all profiles affected).
+                        if error_code in ("timeout", "rate_limited"):
+                            _rotate_delay = 45 if error_code == "timeout" else 15
+                            job.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=_rotate_delay)
+                            job.status = "queued"
+                            db.add(JobLog(job_id=job.id, level="info",
+                                          message=f"Rotate to sibling with {_rotate_delay}s cooldown ({job.retry_count}/{job.max_retry}, code={error_code})"))
+                        else:
+                            job.next_attempt_at = None  # immediate retry on sibling
+                            job.status = "queued"
+                            db.add(JobLog(job_id=job.id, level="info",
+                                          message=f"Retry immediately on sibling profile ({job.retry_count}/{job.max_retry}, code={error_code})"))
                     else:
                         # No sibling available → apply normal backoff
                         # against the SAME profile (give Grok cooldown).
@@ -808,10 +819,38 @@ async def loop(job_type_filter: str | None = None) -> None:
     # task so the loop can pick up another job immediately. Total parallelism is
     # bounded by sum of max_concurrent_jobs across all profiles.
     in_flight: set[asyncio.Task] = set()
-    MAX_IN_FLIGHT = int(os.environ.get("WORKER_MAX_IN_FLIGHT", "16"))
+    MAX_IN_FLIGHT = int(os.environ.get("WORKER_MAX_IN_FLIGHT", "20"))
+    _last_reconcile = time.monotonic()
+    _RECONCILE_INTERVAL = 60  # seconds
 
     while True:
         try:
+            # Periodic counter reconciliation — fixes stale active_jobs counters
+            # that leak when jobs crash without properly releasing their slot.
+            if time.monotonic() - _last_reconcile >= _RECONCILE_INTERVAL:
+                _last_reconcile = time.monotonic()
+                try:
+                    async with SessionLocal() as _rdb:
+                        _profiles = (await _rdb.execute(select(Profile))).scalars().all()
+                        for _p in _profiles:
+                            _live = (await _rdb.execute(
+                                select(func.count()).select_from(Job)
+                                .where(Job.profile_id == _p.id, Job.status.in_(RUNNING_JOB_STATES))
+                            )).scalar_one()
+                            _live_vid = (await _rdb.execute(
+                                select(func.count()).select_from(Job)
+                                .where(Job.profile_id == _p.id, Job.status.in_(RUNNING_JOB_STATES), Job.job_type == "video")
+                            )).scalar_one()
+                            if _p.active_jobs != _live or _p.active_video_jobs != _live_vid:
+                                print(f"[worker] reconcile {_p.name}: active_jobs {_p.active_jobs}->{_live}, video {_p.active_video_jobs}->{_live_vid}", flush=True)
+                                _p.active_jobs = int(_live)
+                                _p.active_video_jobs = int(_live_vid)
+                                if _live == 0 and _p.status == "running_job":
+                                    _p.status = "logged_in"
+                        await _rdb.commit()
+                except Exception as _exc:
+                    print(f"[worker] reconcile error: {_exc}", flush=True)
+
             # Reap finished tasks
             in_flight = {t for t in in_flight if not t.done()}
             if len(in_flight) >= MAX_IN_FLIGHT:
@@ -834,10 +873,43 @@ async def loop(job_type_filter: str | None = None) -> None:
                 continue
 
             async def _run(jid: uuid.UUID):
-                async with SessionLocal() as db2:
-                    j = await db2.get(Job, jid)
-                    if j:
-                        await process_one(db2, j)
+                import random
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        async with SessionLocal() as db2:
+                            j = await db2.get(Job, jid)
+                            if j:
+                                await process_one(db2, j)
+                        break  # Success!
+                    except Exception as exc:  # noqa: BLE001
+                        exc_str = str(exc)
+                        is_deadlock = "deadlock" in exc_str.lower() or "deadlockdetectederror" in exc_str.lower()
+                        if is_deadlock and attempt < max_retries - 1:
+                            backoff = random.uniform(0.5, 2.0)
+                            print(f"[worker] deadlock detected for job {jid}, retrying in {backoff:.2f}s (attempt {attempt+1}/{max_retries})", flush=True)
+                            await asyncio.sleep(backoff)
+                            continue
+                        
+                        print(f"[worker] background task _run failed for job {jid}: {exc}", flush=True)
+                        try:
+                            async with SessionLocal() as db_heal:
+                                async with db_heal.begin():
+                                    job = await db_heal.get(Job, jid)
+                                    if job and job.status in {"running", "processing_provider", "uploading_result"}:
+                                        job.status = "failed"
+                                        job.error_message = f"[worker_crash] Task crashed: {type(exc).__name__}: {exc}"
+                                        if job.profile_id:
+                                            p = await db_heal.get(Profile, job.profile_id)
+                                            if p:
+                                                p.active_jobs = max(0, p.active_jobs - 1)
+                                                if job.job_type == "video":
+                                                    p.active_video_jobs = max(0, p.active_video_jobs - 1)
+                                                if p.active_jobs == 0 and p.status == "running_job":
+                                                    p.status = "logged_in"
+                        except Exception as heal_exc:  # noqa: BLE001
+                            print(f"[worker] background task _run healing failed: {heal_exc}", flush=True)
+                        break
 
             task = asyncio.create_task(_run(claimed_id))
             in_flight.add(task)

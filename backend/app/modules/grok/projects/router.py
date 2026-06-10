@@ -925,7 +925,7 @@ async def auto_provision_project(
                 except Exception:  # noqa: BLE001
                     pass
                 try:
-                    await browser.close()
+                    await browser.disconnect()
                 except Exception:  # noqa: BLE001
                     pass
     except PWTimeout as exc:
@@ -960,7 +960,7 @@ async def auto_provision_project(
                         "() => document.body.innerText.split('\\n').filter(s => s.trim()).slice(0, 40).join(' | ')"
                     )
                     diag = f"current_url={url_now} | first_lines={body[:600]}"
-                await browser.close()
+                await browser.disconnect()
         except Exception as exc:  # noqa: BLE001
             diag = f"diag-capture-error: {exc}"
         raise InvalidPayload(

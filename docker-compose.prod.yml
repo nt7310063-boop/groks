@@ -46,7 +46,8 @@ services:
         condition: service_healthy
     volumes:
       - storage_data:/app/storage
-      - profile_data:/app/browser_profiles
+      - ./browser_profiles:/app/browser_profiles
+      - /var/run/docker.sock:/var/run/docker.sock
 
   worker:
     build:
@@ -67,8 +68,11 @@ services:
         condition: service_healthy
     volumes:
       - storage_data:/app/storage
-      - profile_data:/app/browser_profiles
+      - ./browser_profiles:/app/browser_profiles
+      - /var/run/docker.sock:/var/run/docker.sock
     command: ["python", "-m", "app.workers.run"]
+    healthcheck:
+      test: ["NONE"]
 
   frontend:
     build:
@@ -78,6 +82,12 @@ services:
         VITE_API_BASE_URL: ${PUBLIC_API_URL:?set in .env.prod, e.g. https://api.example.com}
     image: grokflow/frontend:${TAG:-latest}
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["NONE"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   caddy:
     image: caddy:2.8-alpine
