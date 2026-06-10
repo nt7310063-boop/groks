@@ -1522,7 +1522,7 @@ class GrokProvider(Provider):
                 # Apply UI controls from options. Prefer explicit aspect/quality/
                 # duration over the size-derived ratio.
                 opts = job.options or {}
-                ratio = opts.get("aspect") or self._size_to_ratio(opts.get("size") or "")
+                ratio = opts.get("aspect_ratio") or opts.get("ratio") or opts.get("aspect") or self._size_to_ratio(opts.get("size") or "")
                 if ratio:
                     try:
                         await self._set_aspect_ratio(page, ratio)
