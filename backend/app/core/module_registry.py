@@ -28,22 +28,28 @@ def _load_modules() -> list[ModuleManifest]:
     """
     from app.modules.auth import manifest as auth
     from app.modules.auth.api_keys import manifest as api_keys
+    from app.modules.admin.notifications import manifest as admin_notifications
+    from app.modules.admin.domain_config import manifest as domain_config
     from app.modules.sdk import manifest as sdk
     from app.modules.grok.files import manifest as grok_files
     from app.modules.grok.jobs import manifest as grok_jobs
     from app.modules.grok.profiles import manifest as grok_profiles
     from app.modules.grok.projects import manifest as grok_projects
     from app.modules.prompt_history import manifest as prompt_history
+    from app.modules.landing.client_api import manifest as client_api
 
     return [
         auth,
         api_keys,
+        admin_notifications,
+        domain_config,
         grok_profiles,
         grok_jobs,
         grok_files,
         grok_projects,
         sdk,
         prompt_history,
+        client_api,
     ]
 
 

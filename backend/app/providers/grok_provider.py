@@ -863,6 +863,7 @@ class GrokProvider(Provider):
                 # through to Playwright in case it's a transient REST glitch.
                 return None
 
+        retry_after_refresh = False
         try:
             image_bytes_list = await client.imagine(
                 prompt=job.prompt,
@@ -880,18 +881,54 @@ class GrokProvider(Provider):
             _STATSIG_CACHE.pop(f"{profile_id}:video", None)
             _COOKIES_CACHE.pop(profile_id, None)
             if exc.code == "provider_blocked":
-                # CF / statsig saying no. Mark this profile so the next
-                # several minutes of jobs skip the API attempt entirely
-                # — saves ~15s/job on the critical path.
-                self._mark_api_blocked(job.profile_path)
-            if exc.code == "cookie_expired":
+                # On a burst of concurrent jobs, sibling jobs reuse one cached
+                # statsig token; when it goes stale they all 403 at once. Instead
+                # of immediately benching the profile (which dumps every queued
+                # job onto the slower Playwright path and trips the DOM tab
+                # limit), re-capture fresh cookies + statsig and retry the API
+                # ONCE. Only a second consecutive block benches the profile.
+                retry_after_refresh = True
+            elif exc.code == "cookie_expired":
                 return JobResult(
                     success=False,
                     error_code="cookie_expired",
                     error_message=exc.message,
                     retryable=False,
                 )
-            return None
+            else:
+                return None
+
+        if retry_after_refresh:
+            refreshed = await self._build_api_session(job)
+            if refreshed is None:
+                # Couldn't even rebuild the session — let Playwright try.
+                self._mark_api_blocked(job.profile_path)
+                return None
+            retry_client, _retry_pid, retry_tag = refreshed
+            try:
+                self._log(retry_tag, "provider_blocked — retrying API once with fresh statsig/cookies")
+                image_bytes_list = await retry_client.imagine(
+                    prompt=job.prompt,
+                    project_id=job.grok_project_id,
+                    attachment=attachment_meta,
+                    log=lambda m: self._log(retry_tag, m),
+                )
+            except GrokAPIError as exc2:
+                self._log(retry_tag, f"API retry error: {exc2.code} — {exc2.message}")
+                _STATSIG_CACHE.pop(profile_id, None)
+                _STATSIG_CACHE.pop(f"{profile_id}:video", None)
+                _COOKIES_CACHE.pop(profile_id, None)
+                if exc2.code == "provider_blocked":
+                    # Second block in a row → genuine CF/statsig wall, bench it.
+                    self._mark_api_blocked(job.profile_path)
+                elif exc2.code == "cookie_expired":
+                    return JobResult(
+                        success=False,
+                        error_code="cookie_expired",
+                        error_message=exc2.message,
+                        retryable=False,
+                    )
+                return None
 
         files = [
             ResultFile(bytes=b, name=f"image-{i}.jpg", mime="image/jpeg")
@@ -2166,17 +2203,30 @@ class GrokProvider(Provider):
                     # Then images (could be input preview echoed back, or output)
                     for idx, img_url in enumerate(sorted(new_urls_set)):
                         try:
-                            resp = await client.get(img_url, headers={"Referer": target_url, "User-Agent": ua})
-                            if resp.status_code != 200:
-                                continue
-                            mime = resp.headers.get("content-type", "image/png").split(";")[0].strip()
-                            ext = self._ext_for_mime(mime)
-                            downloaded.append(ResultFile(
-                                bytes=resp.content,
-                                name=f"grok_image_{int(time.time())}_{idx + 1}.{ext}",
-                                mime=mime,
-                                source_url=img_url,
-                            ))
+                            if img_url.startswith("data:image/"):
+                                import base64 as _base64
+                                header, base64_data = img_url.split(",", 1)
+                                mime = header.split(";", 1)[0].replace("data:", "")
+                                ext = self._ext_for_mime(mime)
+                                img_bytes = _base64.b64decode(base64_data)
+                                downloaded.append(ResultFile(
+                                    bytes=img_bytes,
+                                    name=f"grok_image_{int(time.time())}_{idx + 1}.{ext}",
+                                    mime=mime,
+                                    source_url="data:image/...",
+                                ))
+                            else:
+                                resp = await client.get(img_url, headers={"Referer": target_url, "User-Agent": ua})
+                                if resp.status_code != 200:
+                                    continue
+                                mime = resp.headers.get("content-type", "image/png").split(";")[0].strip()
+                                ext = self._ext_for_mime(mime)
+                                downloaded.append(ResultFile(
+                                    bytes=resp.content,
+                                    name=f"grok_image_{int(time.time())}_{idx + 1}.{ext}",
+                                    mime=mime,
+                                    source_url=img_url,
+                                ))
                         except Exception:  # noqa: BLE001
                             continue
 
@@ -2269,10 +2319,13 @@ class GrokProvider(Provider):
                 ];
                 document.querySelectorAll('img').forEach(i => {
                     const s = i.src || '';
-                    if (!s.startsWith('http')) return;
-                    if (urlExclude.some(rx => rx.test(s))) return;
+                    const isBase64 = s.startsWith('data:image/');
+                    if (!s.startsWith('http') && !isBase64) return;
+                    if (!isBase64) {
+                        if (urlExclude.some(rx => rx.test(s))) return;
+                        if (!generated.some(rx => rx.test(s))) return;
+                    }
                     if (altExclude.some(rx => rx.test(i.alt || ''))) return;
-                    if (!generated.some(rx => rx.test(s))) return;
                     // Skip the prompt-bar attach preview (always inside <form>)
                     // and the 'Most recent favorite' thumbnail (inside <form>
                     // with role=button). Real result images sit inside the

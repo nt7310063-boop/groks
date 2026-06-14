@@ -25,6 +25,8 @@ if there was no cache. Never raises out to the caller.
 from __future__ import annotations
 
 import functools
+
+from fastapi import APIRouter
 import json
 import logging
 from typing import Any, Callable
@@ -34,6 +36,8 @@ from pydantic import BaseModel
 from app.core.redis_client import get_redis
 
 log = logging.getLogger(__name__)
+
+router = APIRouter()
 
 
 def _serialize(value: Any) -> str | None:
