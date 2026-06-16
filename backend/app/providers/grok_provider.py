@@ -170,6 +170,74 @@ async def _cdp_force_close(cdp_endpoint: str, target_id: str) -> bool:
         return False
 
 
+async def _sweep_orphan_imagine_tabs(cdp_endpoint: str, *, logger=None, tag: str = "") -> int:
+    """Close /imagine tabs that no Playwright client owns anymore.
+
+    The per-job finally close() handles tabs the job opened itself, but two
+    classes of strays slip through:
+      • API path returns early without ever opening a Playwright tab — but
+        a sibling job opened one earlier that's now sitting on /imagine.
+      • Job died before reaching nav (CF block, network glitch) — page.close
+        was called on a half-attached tab and silently failed.
+    Both leave tabs at /imagine which the URL-pattern sweeps deliberately
+    skip (an active sibling could be using one).
+
+    We use CDP `/json/list` to identify tabs that are NOT attached to any
+    debugger right now (`attached=False`). A live Playwright session would
+    show attached=True for its tab, so anything at /imagine + unattached
+    is genuinely orphaned. Always keeps at least one anchor tab — closing
+    every target makes Target.createTarget fail with 'Failed to open new tab'.
+    """
+    if not cdp_endpoint:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=5) as cli:
+            r = await cli.get(f"{cdp_endpoint}/json/list")
+            if r.status_code != 200:
+                return 0
+            targets = r.json() or []
+    except Exception:  # noqa: BLE001
+        return 0
+
+    pages = [t for t in targets if t.get("type") == "page"]
+    if len(pages) <= 1:
+        return 0  # already minimal — nothing to sweep
+
+    closable: list[dict] = []
+    for t in pages:
+        url = (t.get("url") or "")
+        if "grok.com" not in url and "x.ai" not in url:
+            continue
+        # Only target /imagine tabs (not /imagine/post which job-owned
+        # finally already handles, and not chat/share which other sweeps
+        # already catch). Strip query/fragment first.
+        from urllib.parse import urlsplit
+        path = urlsplit(url).path.rstrip("/")
+        if path != "/imagine":
+            continue
+        if t.get("attached") is True:
+            continue  # someone is debugging it — likely a live job
+        closable.append(t)
+
+    if not closable:
+        return 0
+    # Always leave one /imagine anchor up so Chromium has a non-empty
+    # target list (creating a fresh tab from zero is unreliable).
+    if len(closable) >= len(pages):
+        closable = closable[1:]
+
+    closed = 0
+    for t in closable:
+        tid = t.get("id")
+        if not tid:
+            continue
+        if await _cdp_force_close(cdp_endpoint, tid):
+            closed += 1
+    if closed and logger:
+        logger(tag, f"orphan-sweep: closed {closed} unattached /imagine tab(s)")
+    return closed
+
+
 async def _safe_close(page, *, timeout: float = 3.0,
                       cdp_endpoint: str | None = None,
                       target_id: str | None = None,
@@ -1426,6 +1494,13 @@ class GrokProvider(Provider):
                                     self._log(tag, f"GC closed result tab: …{u[-40:]}")
                     except Exception:  # noqa: BLE001
                         pass
+                    # Final pass: close orphan /imagine tabs (no debugger attached).
+                    try:
+                        await _sweep_orphan_imagine_tabs(
+                            cdp_endpoint, logger=self._log, tag=tag,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -2430,6 +2505,16 @@ class GrokProvider(Provider):
                                 target_id=tid,
                             ):
                                 self._log(tag, f"GC closed stale tab: …{u[-40:]}")
+            except Exception:  # noqa: BLE001
+                pass
+            # Final layer: close /imagine tabs nobody is attached to.
+            # Catches strays from API-path jobs and crashed jobs whose
+            # owner finally couldn't close the half-attached page.
+            try:
+                if cdp_endpoint:
+                    await _sweep_orphan_imagine_tabs(
+                        cdp_endpoint, logger=self._log, tag=tag,
+                    )
             except Exception:  # noqa: BLE001
                 pass
 
