@@ -13,6 +13,7 @@ import os
 import re
 import time
 import uuid
+from urllib.parse import urlparse
 
 import asyncio as _asyncio_for_lock
 
@@ -74,12 +75,131 @@ def _statsig_lock(cache_key: str) -> _asyncio_for_lock.Lock:
 _NAV_LOCKS: dict[str, _asyncio_for_lock.Lock] = {}
 
 
+# Pages currently owned by an in-flight worker. The tab-GC sweeps below
+# match `/imagine/post/<id>` as "stale" and would otherwise close a sibling
+# worker's tab while it's still polling for media — Job A submits, Job B
+# starts, B's pre-open sweep sees A's `/post/<id>` tab and closes it; A
+# then dies with TargetClosedError. By registering the working page here
+# the moment it's created and unregistering only after _safe_close, the
+# sweeps can skip pages another worker still holds.
+# In-flight CDP target IDs across all concurrent jobs on this worker.
+# A page that just navigated to /imagine/post/<uid> is "stale-looking" by
+# URL alone (post/ is in _STALE_PATH_HINTS), but it's actively being
+# polled by its owning job. Without this set, sibling jobs' GC sweep
+# would close it and surface as TargetClosedError on the owner.
+_INFLIGHT_TARGETS: set[str] = set()
+
+
 def _nav_lock(profile_id: str) -> _asyncio_for_lock.Lock:
     lock = _NAV_LOCKS.get(profile_id)
     if lock is None:
         lock = _asyncio_for_lock.Lock()
         _NAV_LOCKS[profile_id] = lock
     return lock
+
+
+# Tabs we always close after a job — they're either job-output pages or
+# stray homepage redirects that eat ~150-300MB Chromium RAM each.
+#   /imagine/post/<id>           — legacy result URL
+#   /project/<id>?chat=<id>      — current result shape
+#   /chat/<id>, /share/<id>      — direct chat / share links
+# Active tabs (raw /imagine, /imagine/video) are NOT in this list, so
+# sibling jobs aren't disturbed.
+_STALE_PATH_HINTS = ("/imagine/post/", "?chat=", "/chat/", "/share/")
+
+
+def _is_stale_grok_tab(url: str, *, include_homepage: bool = True) -> bool:
+    """Return True if the tab is safe to close as job output / stray page.
+
+    Stale = result page from a finished job, or homepage redirect (with
+    or without query params, e.g. /?q=&voice=false). NEVER True for
+    /imagine or /imagine/video — those may belong to a sibling worker
+    that just opened a tab and hasn't navigated yet.
+    """
+    if not url:
+        return False
+    if "grok.com" not in url and "x.ai" not in url:
+        return False
+    if any(s in url for s in _STALE_PATH_HINTS):
+        return True
+    if include_homepage:
+        # Strip query/fragment and trailing slash to detect homepage even
+        # when a redirect appended query params.
+        try:
+            from urllib.parse import urlsplit
+            sp = urlsplit(url)
+            path = (sp.path or "/").rstrip("/")
+            if (sp.netloc.endswith("grok.com")) and path == "":
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
+def _page_target_id(page) -> str | None:
+    """Best-effort extraction of the CDP targetId for a Playwright page.
+
+    Used as a fallback when `page.close()` deadlocks (busy renderer, hung
+    beforeunload, frozen WebSocket frame). With the targetId we can ask
+    Chromium directly via the `/json/close/<id>` HTTP endpoint, which
+    bypasses the WS protocol entirely and reliably kills the tab.
+    """
+    try:
+        # Playwright keeps the CDP target on the impl object as `_targetId`
+        # since 1.20+. The attribute is private but stable; fall through to
+        # alternates so a future rename doesn't break us silently.
+        impl = getattr(page, "_impl_obj", None)
+        for attr in ("_targetId", "_target_id", "target_id"):
+            tid = getattr(impl, attr, None) if impl is not None else None
+            if tid:
+                return str(tid)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+async def _cdp_force_close(cdp_endpoint: str, target_id: str) -> bool:
+    """Last-resort close via Chromium's HTTP DevTools endpoint."""
+    if not cdp_endpoint or not target_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=4) as cli:
+            r = await cli.get(f"{cdp_endpoint}/json/close/{target_id}")
+            return r.status_code in (200, 204) and "Target is closing" in (r.text or "") or r.status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _safe_close(page, *, timeout: float = 3.0,
+                      cdp_endpoint: str | None = None,
+                      target_id: str | None = None,
+                      logger=None, tag: str = "") -> bool:
+    """Close a page with two Playwright attempts then a CDP HTTP fallback.
+
+    Tab leaks observed in prod always traced back to silent timeouts here:
+    a busy renderer (10+ concurrent React boots) makes the CDP WS frame
+    take >3s, we swallowed the exception, and the tab stayed alive
+    forever. The HTTP fallback talks to Chromium's DevTools server
+    directly so it can't be queued behind the renderer.
+    """
+    try:
+        await asyncio.wait_for(page.close(), timeout=timeout)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        first_err = exc
+    try:
+        await asyncio.wait_for(page.close(run_before_unload=False), timeout=timeout * 2)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        second_err = exc
+    if cdp_endpoint and target_id:
+        if await _cdp_force_close(cdp_endpoint, target_id):
+            if logger:
+                logger(tag, f"page.close fell back to CDP /json/close (target={target_id[:8]})")
+            return True
+    if logger:
+        logger(tag, f"page.close failed: {type(second_err).__name__}: {str(second_err)[:120]}")
+    return False
 
 
 PROMPT_TEXTAREA = [
@@ -989,9 +1109,16 @@ class GrokProvider(Provider):
                 return None
 
             page = None
+            own_target_id = None
             try:
                 ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
                 page = await ctx.new_page()
+                # Register this page so sibling worker GC sweeps don't close
+                # it once it navigates to /imagine/post/<uid> (which matches
+                # _STALE_PATH_HINTS by URL alone).
+                own_target_id = _page_target_id(page)
+                if own_target_id:
+                    _INFLIGHT_TARGETS.add(own_target_id)
                 lock = _nav_lock(profile_id)
                 async with lock:
                     try:
@@ -1267,30 +1394,36 @@ class GrokProvider(Provider):
                     )
             finally:
                 # Close the WORKING tab + scoop up any result-page strays
-                # ("grok.com/imagine/post/<id>") that this job may have left
-                # behind. Each lingering tab = ~100MB Chromium RAM, so
-                # leaving them across many jobs balloons VNC memory.
-                # Only close tabs whose URL clearly maps to this job's
-                # output (`/imagine/post/`) — never touch sibling job tabs.
+                # left behind. Each lingering tab = ~100-300MB Chromium
+                # RAM, so leaving them across many jobs balloons VNC memory.
+                if own_target_id:
+                    _INFLIGHT_TARGETS.discard(own_target_id)
                 try:
                     if page:
-                        try:
-                            await asyncio.wait_for(page.close(), timeout=3)
-                        except Exception as exc:  # noqa: BLE001
-                            self._log(tag, f"page.close timeout/error: {exc}")
-                    # Sweep result pages still in the context — these are
-                    # what we see leaking in CDP /json after the job done.
+                        tid = _page_target_id(page)
+                        if not await _safe_close(
+                            page,
+                            cdp_endpoint=cdp_endpoint,
+                            target_id=tid,
+                            logger=self._log,
+                            tag=tag,
+                        ):
+                            self._log(tag, "page.close failed (will retry on next sweep)")
                     try:
                         for p in list(ctx.pages):
                             if p is page:
                                 continue
                             u = (p.url or "")
-                            if "/imagine/post/" in u:
-                                try:
-                                    await asyncio.wait_for(p.close(), timeout=3)
+                            if _is_stale_grok_tab(u):
+                                tid = _page_target_id(p)
+                                if tid and tid in _INFLIGHT_TARGETS:
+                                    continue  # owned by a sibling job — keep it
+                                if await _safe_close(
+                                    p,
+                                    cdp_endpoint=cdp_endpoint,
+                                    target_id=tid,
+                                ):
                                     self._log(tag, f"GC closed result tab: …{u[-40:]}")
-                                except Exception:  # noqa: BLE001
-                                    pass
                     except Exception:  # noqa: BLE001
                         pass
                 except Exception:  # noqa: BLE001
@@ -1397,6 +1530,12 @@ class GrokProvider(Provider):
                 page = await context.new_page()
                 self._log(tag, "new tab opened")
 
+                # Register this page as in-flight so sibling worker GC sweeps
+                # don't close it once it navigates to /imagine/post/<uid>.
+                own_target_id = _page_target_id(page)
+                if own_target_id:
+                    _INFLIGHT_TARGETS.add(own_target_id)
+
                 try:
                     gc_count = 0
                     for old in old_pages_to_close:
@@ -1406,13 +1545,16 @@ class GrokProvider(Provider):
                             u = old.url or ""
                             if not u or u == "about:blank":
                                 continue  # may belong to a sibling worker
-                            if "grok.com" not in u and "x.ai" not in u:
-                                continue  # not ours
-                            # Only close STALE tabs — never close active job tabs
-                            # Active: /imagine (prompt page), /imagine/post/ (polling result)
-                            # Stale: homepage (/), /chat/, /share/, old /project/ tabs
-                            if u.rstrip('/').endswith('grok.com') or '/chat/' in u or '/share/' in u:
-                                await asyncio.wait_for(old.close(), timeout=3)
+                            if not _is_stale_grok_tab(u):
+                                continue
+                            tid = _page_target_id(old)
+                            if tid and tid in _INFLIGHT_TARGETS:
+                                continue  # owned by a sibling job — keep it
+                            if await _safe_close(
+                                old,
+                                cdp_endpoint=cdp_endpoint,
+                                target_id=tid,
+                            ):
                                 gc_count += 1
                         except Exception:  # noqa: BLE001
                             pass
@@ -2256,35 +2398,38 @@ class GrokProvider(Provider):
             # available for next job. The browser object itself is just a CDP
             # connection; closing it doesn't kill the underlying Chromium.
             if page is not None:
-                try:
-                    await asyncio.wait_for(page.close(), timeout=3)
-                except Exception:  # noqa: BLE001
-                    pass
-            # Also sweep any stray result tabs that this job's submit-then-
-            # result navigation may have spawned. Each lingering tab eats
-            # ~150-300MB Chromium RAM.
-            #
-            # Grok URL patterns we close:
-            #   /imagine/post/<id>         — legacy result URL (pre Q2 2026)
-            #   /project/<id>?chat=<id>    — current shape after a job
-            #   /chat/<id>, /share/<id>    — direct chat / share links
-            #
-            # Sibling jobs' /imagine prompt tabs DON'T match any of these
-            # until they themselves finish, so this is collision-safe with
-            # concurrent workers on the same profile.
-            _STALE = ("/imagine/post/", "?chat=", "/chat/", "/share/")
+                tid = _page_target_id(page)
+                # Drop our own in-flight registration first so the sweep below
+                # can't accidentally treat it as sibling-owned (we ARE closing).
+                if tid:
+                    _INFLIGHT_TARGETS.discard(tid)
+                await _safe_close(
+                    page,
+                    cdp_endpoint=cdp_endpoint,
+                    target_id=tid,
+                    logger=self._log,
+                    tag=tag,
+                )
+            # Also sweep any stray result/homepage tabs (incl. /?q=&voice=false
+            # redirects) — each lingering tab eats ~150-300MB Chromium RAM.
+            # _is_stale_grok_tab keeps active /imagine prompt pages safe;
+            # _INFLIGHT_TARGETS keeps a sibling worker's /post/<uid> safe.
             try:
                 if 'context' in locals() and context is not None:
                     for p in list(context.pages):
                         if p is page:
                             continue
                         u = (p.url or "")
-                        if any(s in u for s in _STALE):
-                            try:
-                                await asyncio.wait_for(p.close(), timeout=3)
-                                self._log(tag, f"GC closed result tab: …{u[-40:]}")
-                            except Exception:  # noqa: BLE001
-                                pass
+                        if _is_stale_grok_tab(u):
+                            tid = _page_target_id(p)
+                            if tid and tid in _INFLIGHT_TARGETS:
+                                continue  # owned by a sibling job — keep it
+                            if await _safe_close(
+                                p,
+                                cdp_endpoint=cdp_endpoint,
+                                target_id=tid,
+                            ):
+                                self._log(tag, f"GC closed stale tab: …{u[-40:]}")
             except Exception:  # noqa: BLE001
                 pass
 
