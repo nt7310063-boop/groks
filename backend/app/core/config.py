@@ -46,6 +46,13 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: str = "http://localhost:5173"
 
+    # Canonical public origin (scheme+host, no trailing slash) for absolute
+    # URLs the API hands back to partners — file URLs, callback hints, etc.
+    # When set, overrides Host-header sniffing so internal hostnames like
+    # `backend:8000` (from intra-cluster calls or misconfigured tunnels)
+    # never leak into partner-facing payloads.
+    PUBLIC_API_URL: str = ""
+
     @property
     def job_backoff_seconds(self) -> list[int]:
         return [int(s) for s in self.JOB_BACKOFF_SECONDS.split(",") if s.strip()]

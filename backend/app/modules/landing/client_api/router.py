@@ -192,7 +192,12 @@ def _base_url(request: Request) -> str:
     the relative path into curl, getting cryptic errors. The contract
     now returns full https://host/api/files/<id>/download.
 
-    Scheme detection priority:
+    Resolution order:
+      0. settings.PUBLIC_API_URL — canonical public origin from env.
+         Always wins when set so that intra-cluster calls hitting BE
+         with `Host: backend:8000` (other services, misconfigured CF
+         tunnel, sidecar healthchecks) never leak the docker hostname
+         into partner-facing URLs.
       1. cf-visitor JSON header (Cloudflare's source of truth — the
          tunnel between CF and origin is plaintext HTTP, but cf-visitor
          tells us the client→CF scheme was https).
@@ -201,6 +206,12 @@ def _base_url(request: Request) -> str:
       4. Hardcoded https for any non-localhost host (production
          deploys are always behind TLS; localhost gets http).
     """
+    from app.core.config import settings
+
+    public = (settings.PUBLIC_API_URL or "").strip().rstrip("/")
+    if public:
+        return public
+
     host = request.headers.get("x-forwarded-host") or request.headers.get("host")
     if not host:
         host = request.url.netloc
